@@ -8,10 +8,14 @@ once so you don't have to. I used a simply loop in bash:
 
 ```
 # From S3, recommended
-i=0 ; while true; do i=`expr $i + 1`; wget https://clojars-stats-production.s3.us-east-2.amazonaws.com/downloads-`date -d "now - $i days" "+%Y%m%d"`.edn ; done
+CLOJARS_STATS_ROOT=clojars-stats-production.s3.us-east-2.amazonaws.com
 
 # From Clojars directly
-i=0 ; while true; do i=`expr $i + 1`; wget https://clojars.org/stats/downloads-`date -d "now - $i days" "+%Y%m%d"`.edn ; done
+# CLOJARS_STATS_ROOT=clojars.org/stats
+
+# Starts from yesterday and works its way back, until it finds an EDN file that already exists. Good for backfilling the history.
+i=1 ; while [[ ! -f downloads-`date -d "now - $i days" "+%Y%m%d"`.edn ]]; do wget https://${CLOJARS_STATS_ROOT}/downloads-`date -d "now - $i days" "+%Y%m%d"`.edn ; i=`expr $i + 1`; done
+
 ```
 
 Tip: [babashka](https://github.com/borkdude/babashka) and
