@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+
+CLOJARS_STATS_ROOT=${CLOJARS_STATS_ROOT:-clojars-stats-production.s3.us-east-2.amazonaws.com}
+START=${START:-1}
+i=$START
+
+function fname() {
+  i=$1
+  echo "downloads-`date -d "now - $i days" "+%Y%m%d"`.edn"
+}
+
+while [[ ! -f "$(fname $i)" ]]
+do
+    echo "$i  |  $(fname $i)"
+    curl -sLOJ --progress-bar "https://${CLOJARS_STATS_ROOT}/$(fname $i)"
+    i=`expr $i + 1`
+done
