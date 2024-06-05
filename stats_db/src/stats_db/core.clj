@@ -1,145 +1,111 @@
 (ns stats-db.core
-  (:require #_[datalevin.core :as d]
-            [datomic.api :as d]
-            [clojure.instant :as inst]
-            [clojure.string :as str]
-            [clojure.java.io :as io]
-            [clojure.java.shell :as sh]))
+  (:require
+   [clj-pgcopy.core :as pgcopy]
+   [clojure.instant :as inst]
+   [clojure.java.io :as io]
+   [clojure.java.shell :as sh]
+   [clojure.string :as str]
+   [honey.sql :as sql]
+   [next.jdbc :as jdbc]))
 
-(def db-path "stats_db.datalevin")
+;; docker compose up
+;; ./launchpad
 
-(def attributes
-  [[:project/name :string]
-   [:project/group :string]
-   [:project/full-name :string :identity]
-   [:project/versions :ref :many]
-   [:version/key :string :identity]
-   [:version/number :string]
-   [:version/stats :ref :many]
-   [:stat/date :instant]
-   [:stat/key :string :identity]
-   [:stat/count :long]])
+(def URL "jdbc:postgres://localhost:5432/postgres?user=postgres&password=postgres")
+(def DS (jdbc/get-datasource URL))
+(def CONN (jdbc/get-connection CONN))
 
-(def schema (for [[attr type & tags] attributes]
-              (cond-> {:db/ident attr
-                       :db/valueType (keyword "db.type" (name type))
-                       :db/cardinality (if (some #{:many} tags)
-                                         :db.cardinality/many
-                                         :db.cardinality/one)}
-                (some #{:identity} tags)
-                (assoc :db/unique :db.unique/identity)
-                )))
+(defn format-qry [qry] (cond-> qry (string? qry) vector (map? qry) sql/format))
+(defn exec! [qry] (jdbc/execute! DS (format-qry qry)))
 
-#_
-(sh/sh "sh" "-c" (str "rm -rf " db-path))
+(def columns [[:groupname :text]
+              [:name :text]
+              [:full_name :text]
+              [:version :text]
+              [:date :date]
+              [:downloads :bigint]])
 
-(d/create-database "datomic:free://localhost:4334/clojars")
-(def conn (d/connect "datomic:free://localhost:4334/clojars"))
-#_
-(d/close conn)
+(defn create-table! []
+  (exec! {:create-table :stats
+          :with-columns columns}))
 
-(d/transact conn schema)
-
-(defn stats-tx [date downloads]
-  (let [inst (inst/read-instant-date date)]
-    (for [[[group project] versions]   downloads
-          :let [full-name   (str/join "/" [group project])]]
-      {:project/group     group
-       :project/name      project
-       :project/full-name full-name
-       :project/versions
-       (for [[version-number stats-count] versions
-             :let [version-key (str/join "/" [group project version-number])
-                   stat-key    (str/join "/" [group project version-number date])]]
-         {:version/number version-number
-          :version/key    version-key
-          :version/stats  [{:stat/date  inst
-                            :stat/count stats-count
-                            :stat/key   stat-key
-                            }]})})))
-
-(defn file->date [f]
-  (str/join "-" (next (re-find #"(\d{4})(\d{2})(\d{2})" (str f)))))
+(defn rand-file []
+  (rand-nth (filter #(re-find #"downloads-\d+" (str %)) (file-seq (io/file "..")))))
 
 (defn read-edn-file [f]
   (with-open [r (java.io.PushbackReader. (io/reader f))]
     (read r)))
 
-#_
-(let [f (rand-nth (filter #(re-find #"downloads-\d+" (str %)) (file-seq (io/file ".."))))]
-  (stats-tx
-   (file->date f)
-   (read-edn-file f)))
-#_
-(doseq [f (sort-by str (file-seq (io/file "..")))
+(def files
+  (for [f (sort-by str (file-seq (io/file "..")))
         :when (re-find #"downloads-\d+" (str f))]
-  (print ".")
+    f))
+
+(defn file->tuples [f]
   (try
-    (d/transact! conn (stats-tx (file->date f) (read-edn-file f)))
+    (let [[_ y m d] (re-find #"-(.{4})(.{2})(.{2})\.edn" (.getName f))
+          date (java.sql.Date. (- (parse-long y) 1900) (dec (parse-long m)) (parse-long d))]
+      (doall
+       (for [[[groupname name] versions] (read-edn-file f)
+             :let [fname (str groupname "/" name)]
+             [version cnt] versions]
+         [groupname name fname version date cnt])))
     (catch Exception e
-      (println)
-      (println (file->date f))
-      (println (.getMessage e)))))
+      (println "Error in" f ", " (.getMessage e)))))
 
-(def cnt (volatile! 0))
-
-(doseq [f (reverse (sort-by str (file-seq (io/file ".."))))
-        :when (re-find #"downloads-\d+" (str f))
-        :let [date (file->date f)]]
-  (try
-    (println date)
-    (d/transact conn (stats-tx date (read-edn-file f)))
-    (catch Exception e
-      (println (.getMessage e)))))
-
-(count
- (for [f (reverse (sort-by str (file-seq (io/file ".."))))
-       :when (re-find #"downloads-\d+" (str f))
-       e (try (stats-tx (file->date f) (read-edn-file f))
-              (catch Exception e
-                (println (file->date f))
-                (println (.getMessage e))))
-       :when e]
-   e))
-
-(first
- (for [f (sort (file-seq (io/file "..")))
-       :when (re-find #"downloads-\d+" (str f))]
-   (flatten (stats-tx (file->date f) (read-edn-file f)))))
-
-(str f)
+(create-table!)
 
 
-
-(d/q '{:find [(pull ?e [*])]
-       :where [[?e :project/group "lambdaisland"]]}
-     (d/db conn))
-
-(d/q '{:find [(pull ?s [*])
-              ]
-       :where [[?e :version/stats ?s]]}
-     @conn)
-
-(def c
-  (d/q '{:find [?proj (sum ?count)]
-         :where [[?p :project/full-name ?proj]
-                 [?p :project/versions ?v]
-                 [?v :version/stats ?s]
-                 [?s :stat/count ?count]
-                 [?s :stat/date #inst "2020-05-01"]]}
-       (d/db conn))
-  )
-
-(take 100 (reverse (sort-by second c)))
+;; takes about a minute on a fast-ish machine
+(time
+ (pgcopy/copy-into! CONN
+                    :stats
+                    (map first columns)
+                    (sequence cat (pmap file->tuples files))))
 
 
-(take 100
-      (sort-by (comp #(* -1 %) second)
-               (d/q '{:find [?proj (sum ?count)]
-                      :where [[?s :stat/date #inst "2020-05-01"]
-                              [?p :project/full-name ?proj]
-                              [?p :project/versions ?v]
-                              [?v :version/stats ?s]
-                              [?s :stat/count ?count]
-                              ]}
-                    (d/db conn))))
+(def this-year
+  (into {}
+        (map
+         (juxt :stats/full_name :sum))
+        (exec! {:select [[:full_name] [[:sum :downloads]]]
+                :from [:stats]
+                :where [[:raw "date between '2024-02-01' and '2024-05-01'"]]
+                :group-by [:full_name]
+                :order-by [[:sum :desc]]})))
+
+(def last-year
+  (into {}
+        (map
+         (juxt :stats/full_name :sum))
+        (exec! {:select [[:full_name] [[:sum :downloads]]]
+                :from [:stats]
+                :where [[:raw "date between '2023-02-01' and '2023-05-01'"]]
+                :group-by [:full_name]
+                :order-by [[:sum :desc]]})))
+
+(sort-by #(- (val %))
+         (into {}
+               (remove (comp last-year key) this-year)))
+
+(sort-by #(- (second %))
+         (map
+          (fn [[k v]]
+            [k (double (/ (long v) (long (get last-year k)))) (long v) (long (get last-year k))])
+          (remove #(< (get last-year (key %) 0) 100) this-year)))
+
+(sort-by #(- (val %))
+         (into {}
+               (map
+                (fn [[k v]]
+                  [k (- (long v) (long (get last-year k 0)))]))
+               this-year))
+
+(get this-year "riddley/riddley")
+
+(- (count this-year)
+   (count last-year))
+
+
+(- (apply + (vals this-year))
+   (apply + (vals last-year)))
